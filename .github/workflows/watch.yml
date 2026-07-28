@@ -1,0 +1,62 @@
+# PCIUS off-box uptime watcher — GitHub Actions runner.
+#
+# This repository is public on purpose: Actions minutes are free and unmetered
+# on public repos, and a 5-minute cron is ~8,640 billable minutes a month,
+# which no private-repo allowance would survive.
+#
+# See README.md for the full picture.
+
+name: pcius-watch
+
+on:
+  schedule:
+    # Offset, not */5 — scheduled runs at :00 hit GitHub's busiest queue and
+    # are the most likely to be delayed or dropped.
+    - cron: "3-58/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Probe and format but do not deliver a Telegram message"
+        type: boolean
+        default: false
+
+# The state issue is a shared mutable resource. Never run two checks at once.
+concurrency:
+  group: pcius-watch
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Probe production
+        env:
+          # --- required secrets (Settings -> Secrets and variables -> Actions)
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # --- state store: the stateless-runner backend
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WATCH_STATE_BACKEND: github-issue
+          WATCH_REPO: ${{ github.repository }}
+          WATCH_DRY_RUN: ${{ inputs.dry_run && '1' || '0' }}
+        run: |
+          set +x
+          chmod +x ./check.sh
+          set +e
+          ./check.sh
+          rc=$?
+          # 0 = healthy, 1 = something is down (already reported — NOT a
+          # workflow failure, or every outage would also spam our GitHub
+          # notifications), 2 = the watcher itself is misconfigured (DO fail).
+          if [ "$rc" -eq 2 ]; then
+            echo "::error::pcius-watch is misconfigured"
+            exit 1
+          fi
+          exit 0
