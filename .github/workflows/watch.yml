@@ -10,9 +10,11 @@ name: pcius-watch
 
 on:
   schedule:
-    # Offset, not */5 — scheduled runs at :00 hit GitHub's busiest queue and
-    # are the most likely to be delayed or dropped.
-    - cron: "3-58/5 * * * *"
+    # Plainest form GitHub documents. An offset step-range ("3-58/5") was tried
+    # first and produced ZERO scheduled runs in 52 minutes on this brand-new
+    # repo, so it was swapped out to remove that variable. GitHub's scheduler is
+    # best-effort regardless: runs are routinely late and can be dropped.
+    - cron: "*/5 * * * *"
   workflow_dispatch:
     inputs:
       dry_run:
