@@ -181,8 +181,14 @@ Everything else is tunable by environment variable; the defaults are listed at t
 
 ## Running it by hand
 
-Use the **Run workflow** button on the Actions tab. It takes a `dry_run` input — leave it on for a
-rehearsal that probes production and formats the message without delivering anything.
+Use the **Run workflow** button on the Actions tab. It takes two inputs:
+
+- **`dry_run`** — probe production and format the message, but deliver nothing. A safe rehearsal.
+- **`test_message`** — send exactly one "watcher is alive" Telegram message and do nothing else.
+  This is how you prove the alert path still works (stored secrets, runner egress, Telegram)
+  *without* faking an outage. It never touches the state issue, so it cannot confuse a real
+  incident. Worth running occasionally — it doubles as a manual stand-in for the heartbeat that
+  does not exist yet, and it resets nothing else.
 
 Locally:
 

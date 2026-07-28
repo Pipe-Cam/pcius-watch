@@ -19,6 +19,10 @@ on:
         description: "Probe and format but do not deliver a Telegram message"
         type: boolean
         default: false
+      test_message:
+        description: "Send ONE 'watcher is alive' Telegram message and do nothing else"
+        type: boolean
+        default: false
 
 # The state issue is a shared mutable resource. Never run two checks at once.
 concurrency:
@@ -36,7 +40,32 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Proves the whole alert path — stored secrets, runner egress, Telegram —
+      # WITHOUT faking an outage. Manual only, and it never touches the state
+      # issue, so it cannot confuse a real incident. Sends exactly one message.
+      # This is also the poor man's stand-in for the weekly heartbeat until
+      # that gets built.
+      - name: Send one test message
+        if: ${{ inputs.test_message }}
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          set +x
+          # --config keeps the token out of the process argv. -o /dev/null
+          # discards the response body, which can echo request context.
+          code="$(printf 'url = "https://api.telegram.org/bot%s/sendMessage"\ndata-urlencode = "chat_id=%s"\ndata-urlencode = "text=%s"\n' \
+            "$TELEGRAM_BOT_TOKEN" "$TELEGRAM_CHAT_ID" \
+            "🧪 PCIUS watcher installed — this is a test, production is fine. You will only hear from this again if something actually breaks." \
+            | curl -sS -o /dev/null -w '%{http_code}' --config - )"
+          if [ "$code" != "200" ]; then
+            echo "::error::Telegram sendMessage returned HTTP ${code:-none}"
+            exit 1
+          fi
+          echo "test message delivered"
+
       - name: Probe production
+        if: ${{ !inputs.test_message }}
         env:
           # --- required secrets (Settings -> Secrets and variables -> Actions)
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
