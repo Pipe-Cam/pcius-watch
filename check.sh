@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # ---------------------------------------------------------------------------
-# PCIUS off-box uptime watcher.
+# PCIUS off-box uptime watcher — Chunk 1 of planning/SPEC-alerting-2026-07-28.md
 #
 # Probes the production surfaces from OUTSIDE our infrastructure and sends
-# ONE Telegram message when they break, silence while they stay broken,
+# Brian ONE Telegram message when they break, silence while they stay broken,
 # and ONE message when they come back.
 #
 # HOST-AGNOSTIC ON PURPOSE. This script knows nothing about GitHub. It runs
@@ -16,7 +16,7 @@
 #
 # TELEGRAM RULE, NON-NEGOTIABLE: this script calls sendMessage and NOTHING
 # else. It must never call getUpdates / setWebhook / deleteWebhook — a second
-# poller on that token gets a 409 and breaks the live chat that shares it.
+# poller on that token gets a 409 and breaks Brian's live task intake channel.
 #
 # Exit codes: 0 = all surfaces healthy. 1 = at least one surface down.
 #             2 = configuration/usage error.
@@ -30,8 +30,8 @@ set -uo pipefail
 WATCH_API_URL="${WATCH_API_URL:-https://api.pipecam.report/health}"
 WATCH_APP_URL="${WATCH_APP_URL:-https://app.pipecam.report/signin}"
 # A public, unauthenticated, read-only endpoint that performs a real database
-# round-trip (a multi-table join in the report-token resolver on the API
-# side). A nonexistent token returns 200 {"state":"not_found"}
+# round-trip (5-table join in resolveToken, platform/apps/api/src/routes/
+# public-reports.ts:45-65). A nonexistent token returns 200 {"state":"not_found"}
 # and writes nothing. If Postgres is down this 500s while /health still says ok.
 WATCH_DB_URL="${WATCH_DB_URL:-https://api.pipecam.report/api/public/reports/pcius-watch-liveness-probe}"
 
@@ -47,9 +47,9 @@ WATCH_ATTEMPT_SLEEP="${WATCH_ATTEMPT_SLEEP:-20}"
 WATCH_FAIL_CYCLES="${WATCH_FAIL_CYCLES:-2}"
 
 # Coming back up: re-probe once more after this many seconds inside the same
-# run before declaring recovery. A box coming back from an outage can serve
-# 502s under load for a while; one premature all-clear is worse than a late
-# one.
+# run before declaring recovery. After the 2026-07-28 recovery the box served
+# 502s under load ~10 for a while; one premature all-clear is worse than a
+# late one.
 WATCH_RECOVER_CONFIRM_SLEEP="${WATCH_RECOVER_CONFIRM_SLEEP:-60}"
 
 # State store: "file" (VPS cron, laptop) or "github-issue" (stateless runner).
@@ -113,7 +113,7 @@ fmt_duration() {
 
 PROBE_REASON=""
 
-# /health is STATIC on our API — it returns ok:true
+# /health is STATIC (platform/apps/api/src/app.ts:155-161) — it returns ok:true
 # even with the database on fire. A 200 is necessary but NOT sufficient proof
 # of life, so we also assert the response SHAPE and that the deployed commit
 # sha is actually present. That catches a proxy/error page answering 200 in the
@@ -127,15 +127,22 @@ probe_api() {
     PROBE_REASON="HTTP ${code:-none}"
     return 1
   fi
-  case "$body" in
-    *'"ok":true'*) : ;;
-    *) PROBE_REASON="200 but body is not ok:true"; return 1 ;;
-  esac
-  if ! printf '%s' "$body" | grep -Eq '"version":"[0-9a-fA-F]{7,}"'; then
+  # Whitespace after the colon is OPTIONAL in these patterns. Hono's c.json()
+  # emits compact JSON today, so a literal '"ok":true' match works — but this
+  # is an alerting path, and the cost of being wrong is a false 3am "PCIUS is
+  # down" for a perfectly healthy box. A serializer change, a pretty-printing
+  # proxy, or anything that reformats the body must not be able to do that.
+  # (Found the hard way: a test double using json.dumps() defaults, which emit
+  # '"ok": true', failed every probe against a server that was fully up.)
+  if ! printf '%s' "$body" | grep -Eq '"ok"[[:space:]]*:[[:space:]]*true'; then
+    PROBE_REASON="200 but body is not ok:true"
+    return 1
+  fi
+  if ! printf '%s' "$body" | grep -Eq '"version"[[:space:]]*:[[:space:]]*"[0-9a-fA-F]{7,}"'; then
     PROBE_REASON="200 but version sha missing or empty"
     return 1
   fi
-  if ! printf '%s' "$body" | grep -q '"ts":"'; then
+  if ! printf '%s' "$body" | grep -Eq '"ts"[[:space:]]*:[[:space:]]*"'; then
     PROBE_REASON="200 but ts missing"
     return 1
   fi
@@ -143,8 +150,8 @@ probe_api() {
   return 0
 }
 
-# The sign-in page is served by a DIFFERENT service process than the API,
-# so it is a genuinely separate signal.
+# The sign-in page is served by a DIFFERENT systemd unit (pcius-app.service)
+# than the API (pcius-api.service), so it is a genuinely separate signal.
 probe_app() {
   local code
   code="$(curl -s --max-time "$WATCH_TIMEOUT_APP" -o /dev/null -w '%{http_code}' "$WATCH_APP_URL" 2>/dev/null)"
@@ -165,7 +172,7 @@ probe_db() {
     PROBE_REASON="HTTP ${code:-none} (a 5xx here usually means the database)"
     return 1
   fi
-  if ! printf '%s' "$body" | grep -Eq '"state":"[a-z_]+"'; then
+  if ! printf '%s' "$body" | grep -Eq '"state"[[:space:]]*:[[:space:]]*"[a-z_]+"'; then
     PROBE_REASON="200 but no query result in the body"
     return 1
   fi
@@ -259,7 +266,7 @@ store_note() {
 # One long-lived issue whose BODY is the state blob and whose TITLE reflects
 # current status, so a human scrolling the repo sees "down" at a glance and
 # the transition comments form a timestamped incident log (which is what you
-# need to claim a hosting SLA credit — those are not automatic).
+# need to claim a Hostinger SLA credit — those are not automatic).
 GH_ISSUE_NUMBER=""
 gh_issue_find() {
   [ -n "$WATCH_REPO" ] || { log "FATAL github-issue backend needs WATCH_REPO=owner/name"; exit 2; }
@@ -362,7 +369,7 @@ send_telegram() {
   return 1
 }
 
-# ── Message bodies ────────────────────────────────────────────────────────
+# ── Message bodies (§8 of the spec; wording is Brian's to change) ──────────
 compose_alarm() {
   local when="$1" what
   # CYCLE_DOWN is always built in the order api, app, db.
