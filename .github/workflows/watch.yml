@@ -1,19 +1,32 @@
 # PCIUS off-box uptime watcher — GitHub Actions runner.
 #
-# This repository is public on purpose: Actions minutes are free and unmetered
-# on public repos, and a 5-minute cron is ~8,640 billable minutes a month,
-# which no private-repo allowance would survive.
+# COPY THIS FILE to `.github/workflows/watch.yml` IN THE PUBLIC WATCH REPO
+# (Pipe-Cam/pcius-watch), alongside check.sh and peer-check.sh at the repo root.
+# It deliberately does NOT live in .github/workflows/ here: a 5-minute cron on
+# the private Pipe-Cam/pcius repo would burn ~8,640 billable minutes a month
+# against a 3,000-minute allowance, with the org budget set to $0/stop — which
+# already blocked deploys once on 2026-07-12. Public repo = free and unmetered.
 #
-# See README.md for the full picture.
+# THIS SIDE IS THE JUNIOR PARTNER. Measured over 181 hours (2026-07-28 to
+# 2026-08-05) this workflow received 107 of the 2,172 scheduled runs it asked
+# for — a 4.9% delivery rate, median gap 90 minutes, worst gap 3.6 hours. It is
+# NOT a five-minute watchdog and must never be relied on as one. The dependable
+# check is the systemd timer on srv1550328; this workflow's real job is to be
+# an INDEPENDENTLY SCHEDULED second opinion, so that if that box dies, something
+# on completely different infrastructure notices and says so.
+#
+# See operations/watch/RUNBOOK.md for the full picture.
 
 name: pcius-watch
 
 on:
   schedule:
     # Plainest form GitHub documents. An offset step-range ("3-58/5") was tried
-    # first and produced ZERO scheduled runs in 52 minutes on this brand-new
-    # repo, so it was swapped out to remove that variable. GitHub's scheduler is
-    # best-effort regardless: runs are routinely late and can be dropped.
+    # first and produced ZERO scheduled runs in 52 minutes, so it was swapped
+    # out to remove that variable — but see the delivery-rate note above: the
+    # cron expression was never the problem. GitHub's scheduler simply drops
+    # the overwhelming majority of high-frequency runs. Do not spend another
+    # afternoon tuning this expression; it will not help.
     - cron: "*/5 * * * *"
   workflow_dispatch:
     inputs:
@@ -26,7 +39,7 @@ on:
         type: boolean
         default: false
 
-# The state issue is a shared mutable resource. Never run two checks at once.
+# The state issues are shared mutable resources. Never run two checks at once.
 concurrency:
   group: pcius-watch
   cancel-in-progress: false
@@ -38,15 +51,13 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 6
+    timeout-minutes: 8
     steps:
       - uses: actions/checkout@v4
 
       # Proves the whole alert path — stored secrets, runner egress, Telegram —
       # WITHOUT faking an outage. Manual only, and it never touches the state
       # issue, so it cannot confuse a real incident. Sends exactly one message.
-      # This is also the poor man's stand-in for the weekly heartbeat until
-      # that gets built.
       - name: Send one test message
         if: ${{ inputs.test_message }}
         env:
@@ -88,6 +99,48 @@ jobs:
           # notifications), 2 = the watcher itself is misconfigured (DO fail).
           if [ "$rc" -eq 2 ]; then
             echo "::error::pcius-watch is misconfigured"
+            exit 1
+          fi
+          exit 0
+
+      # --- the other half of the mutual heartbeat ---------------------------
+      # srv1550328 force-pushes a single-commit `heartbeat` branch to this repo
+      # every 15 minutes; the commit date is its proof of life. If that stops
+      # moving, the dependable watcher is dead and NOBODY is checking
+      # production reliably — which is exactly the silent failure that let
+      # 2026-07-28 run for six hours. This step is why that is now noisy.
+      #
+      # `always()` matters: this must still run when the probe step reported an
+      # outage. An incident is precisely when you need to know whether your
+      # other watcher is alive.
+      - name: Check on the srv1550328 watcher
+        if: ${{ always() && !inputs.test_message }}
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PEER_NAME: the srv1550328 watcher
+          PEER_KIND: git-ref
+          PEER_REPO: ${{ github.repository }}
+          PEER_REF: heartbeat
+          # The peer publishes every 15 minutes, so 60 minutes is four missed
+          # pushes. Generous enough that a slow push or a brief reboot never
+          # pages Brian, tight enough that a genuinely dead box is caught on
+          # the very next scheduled run.
+          PEER_STALE_AFTER: "3600"
+          PEER_STATE_BACKEND: github-issue
+          PEER_STATE_REPO: ${{ github.repository }}
+          PEER_DRY_RUN: ${{ inputs.dry_run && '1' || '0' }}
+        run: |
+          set +x
+          chmod +x ./peer-check.sh
+          set +e
+          ./peer-check.sh
+          rc=$?
+          # 1 = the peer is stale, which is a REPORTED FINDING, not a broken
+          # workflow. Only 2 (misconfigured) turns the run red.
+          if [ "$rc" -eq 2 ]; then
+            echo "::error::pcius-watch peer check is misconfigured"
             exit 1
           fi
           exit 0
