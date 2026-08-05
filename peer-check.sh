@@ -78,6 +78,21 @@ log() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
 
 command -v jq >/dev/null 2>&1 || { log "FATAL jq is required but not installed"; exit 2; }
 
+# Validate the state backend HERE, in the main shell, not lazily inside
+# store_load. store_load is called as `STATE_BLOB="$(store_load)"`, and an
+# `exit` inside a command substitution only kills the subshell — the script
+# would sail on with empty state, which means NO DEDUP, which means a message
+# every single run. Crying wolf is the one failure this whole design exists to
+# avoid, so a misconfigured store has to be fatal for real.
+case "$PEER_STATE_BACKEND" in
+  file) : ;;
+  github-issue)
+    command -v gh >/dev/null 2>&1 || { log "FATAL PEER_STATE_BACKEND=github-issue needs the gh CLI"; exit 2; }
+    [ -n "$PEER_STATE_REPO" ] || { log "FATAL PEER_STATE_BACKEND=github-issue needs PEER_STATE_REPO"; exit 2; }
+    ;;
+  *) log "FATAL unknown PEER_STATE_BACKEND=$PEER_STATE_BACKEND"; exit 2 ;;
+esac
+
 NOW="$(date -u +%s)"
 fmt_utc() { date -u -d "@$1" '+%H:%M UTC, %a %d %b'; }
 fmt_local() { TZ="$WATCH_TZ" date -d "@$1" '+%H:%M %Z, %a %d %b'; }
