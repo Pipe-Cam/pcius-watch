@@ -119,7 +119,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PEER_NAME: the srv1550328 watcher
+          PEER_NAME: "the srv1550328 watcher [TEST 10:15 UTC — proving the heartbeat, no action needed]"
           PEER_KIND: git-ref
           PEER_REPO: ${{ github.repository }}
           PEER_REF: heartbeat
