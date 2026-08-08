@@ -1,0 +1,11 @@
+This file is a liveness heartbeat, not documentation.
+
+It is rewritten and force-pushed every few minutes by the PCIUS uptime
+watcher running on a VPS that is NOT the production box. The GitHub
+Actions side of the pair reads the COMMIT DATE of this branch and raises
+an alert if it stops moving. See operations/watch/RUNBOOK.md in the pcius
+repo. Nothing here is secret and nothing reads this file at runtime.
+
+host=srv1550328
+epoch=1786213447
+utc=2026-08-08T18:24:07Z
