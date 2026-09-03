@@ -31,7 +31,8 @@ is gone. This checker is the one that does not live on the thing it is checking.
 | File | What it is |
 |---|---|
 | `check.sh` | The entire watcher. Bash + curl, no other dependencies. One run = one check cycle. |
-| `.github/workflows/watch.yml` | The schedule that runs it. |
+| `peer-check.sh` | The watcher-watching-watcher. A second copy of this checker runs on a small VPS of ours, and each side checks that the other is still alive — a single watcher that dies quietly is worse than no watcher at all. Same dependencies, same rules. |
+| `.github/workflows/watch.yml` | The schedule that runs them. |
 | `README.md` | This file. |
 
 `check.sh` is host-agnostic on purpose — it contains no GitHub-specific logic and runs identically
@@ -40,10 +41,18 @@ its state, which sits behind two functions (`store_load` / `store_save`) with tw
 a plain file, or a GitHub issue. This workflow uses the issue backend, because Actions runners keep
 nothing between runs.
 
-**Source of truth.** `check.sh` is maintained inside Pipe Cam's private `pcius` repository at
-`operations/watch/`. This repository is the deployed copy. Comments referencing internal file
-paths, service names and hosting details were removed on the way over; **every executable line is
-byte-identical to the original** (verified by diffing all non-comment lines).
+**Source of truth.** `check.sh` and `peer-check.sh` are maintained inside Pipe Cam's private
+`pcius` repository, at `operations/watch/`. This repository is the deployed copy, and it is a
+**verbatim copy** — nothing is stripped, redacted or rewritten on the way over. That is possible
+because the source files are written to be published: they carry no credentials, no vendor names,
+no incident history and no internal hostnames. Anything an operator needs that would say more than
+that lives in the private runbook instead of in these comments.
+
+A job in the private repository re-checks that daily. It compares the sha256 of every non-comment
+line of both scripts across all three places they exist — this repository, the private source, and
+the box running the other copy — and alarms if any of them disagree. Comments are excluded from
+that comparison deliberately, so that a difference in prose can never mask a difference in
+behaviour, nor be mistaken for one.
 
 ---
 
