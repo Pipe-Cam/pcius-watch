@@ -1,0 +1,14 @@
+This file is a liveness heartbeat, not documentation.
+
+It is rewritten and force-pushed by the PCIUS backup FRESHNESS CHECKER on the production box, once per run, pass or fail.
+A reader outside that box reads the COMMIT DATE of this branch and raises
+an alert if it stops moving — SILENCE IS THE ALARM. See
+operations/watch/RUNBOOK.md in the pcius repo. Nothing here is secret and
+nothing reads this file at runtime.
+
+host=srv1415357
+epoch=1788613497
+utc=2026-09-05T13:04:57Z
+checker=pcius-backup-freshness
+result=fresh
+exit_code=0
