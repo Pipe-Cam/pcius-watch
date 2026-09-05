@@ -1,0 +1,16 @@
+This file is a liveness heartbeat, not documentation.
+
+It is rewritten and force-pushed by the PCIUS watcher drift publisher, recording the sha256 of the NON-COMMENT lines of the watch scripts as they exist ON the watcher box.
+A reader outside that box reads the COMMIT DATE of this branch and raises
+an alert if it stops moving — SILENCE IS THE ALARM. See
+operations/watch/RUNBOOK.md in the pcius repo. Nothing here is secret and
+nothing reads this file at runtime.
+
+host=srv1550328
+epoch=1788640987
+utc=2026-09-05T20:43:07Z
+checker=pcius-watch-drift-publish
+nsha_check_sh=b0198a92f3a25f0f1f5c23af7d6f061328f79dca9518959eb9e9994fed3d5039
+nsha_peer_check_sh=866b8cf066b2e675a6cbd0de3b8b441d6034851881fe3323f3b44b4fd7b70b62
+nsha_heartbeat_push_sh=52b30113afa3f2d4f2895dabfe98ff683098efe2ce9b46cee0e10cc08027bf6f
+nsha_drift_check_sh=93efe97c812f08c975707c2e1312c71d5be03688e55ab424eec25f851ef37f24
