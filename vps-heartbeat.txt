@@ -1,0 +1,14 @@
+This file is a liveness heartbeat, not documentation.
+
+It is rewritten and force-pushed by the PCIUS uptime watcher running on a VPS that is NOT the production box.
+A reader outside that box reads the COMMIT DATE of this branch and raises
+an alert if it stops moving — SILENCE IS THE ALARM. See
+operations/watch/RUNBOOK.md in the pcius repo. Nothing here is secret and
+nothing reads this file at runtime.
+
+host=srv1550328
+epoch=1788653347
+utc=2026-09-06T00:09:07Z
+checker=pcius-watch
+status=healthy
+exit_code=0
