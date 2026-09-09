@@ -150,8 +150,9 @@ gh_api() {
   printf '%s' "$out"
 }
 
-# PRINTS TWO LINES: the epoch, then the producer's own last exit status
-# (`exit_code=` in the heartbeat body) or empty when it published none.
+# PRINTS THREE LINES: the epoch, the producer's own last exit status
+# (`exit_code=` in the heartbeat body) or empty when it published none, and the
+# producer's own `status=` word or empty.
 #
 # WHY THE SECOND LINE EXISTS. A fresh commit date proves the producer RAN. It
 # does not prove the producer could SPEAK. A checker whose Telegram or email
@@ -166,9 +167,27 @@ gh_api() {
 #
 # ⚠ STRICTLY OPTIONAL, AND THAT IS THE CONTRACT. A producer that publishes
 # nothing but a timestamp must still read as ALIVE — see heartbeat-push.sh's
-# header. Absence is "cannot judge", never "broken".
+# header. ABSENCE is "cannot judge", never "broken".
+#
+# ⚠⚠ A PUBLISHED `status=unknown` IS NOT ABSENCE, AND THE DIFFERENCE IS THE
+# WHOLE POINT OF THIS LEG. Absence means the producer never had a status to
+# give. `status=unknown` means the producer HAS a status slot, looked, and
+# found that THE CHECKER IT SPEAKS FOR HAS NOT RUN — heartbeat-push.sh writes
+# exactly that when the checker's state file is missing, unreadable, or older
+# than HB_STATUS_MAX_AGE, and it deliberately omits `exit_code=` so no reader
+# parses a stale number as current health.
+#
+# Until 2026-09-05 this function read only `exit_code=`, so that case arrived
+# here as "no exit_code" and took the absence branch — "freshness only, not
+# judging its channel" — and the run exited 0. The two timers are INDEPENDENT:
+# pcius-watch.timer runs check.sh every 5 min, pcius-watch-heartbeat.timer
+# publishes every 15 min. Stop the first and the second keeps publishing a
+# perfectly FRESH commit date carrying status=unknown, forever. Freshness
+# passed, the exit_code was absent, and this leg reported GREEN while NOTHING
+# WAS PROBING PRODUCTION. That is the 2026-07-28 six-hour outage rebuilt
+# inside the instrument that exists to prevent it.
 peer_last_seen() {
-  local body iso epoch hb_exit=""
+  local body iso epoch hb_exit="" hb_status=""
   case "$PEER_KIND" in
     gha-workflow)
       # Only event=schedule counts. A manual workflow_dispatch proves a human
@@ -186,6 +205,17 @@ peer_last_seen() {
       # Anything that is not a plain integer is not a status; treat it as
       # "none published" rather than guessing.
       case "$hb_exit" in ''|*[!0-9]*) hb_exit="" ;; esac
+      hb_status="$(printf '%s' "$body" | jq -r '.files[0].patch // ""' \
+        | sed -n 's/^[+ ]*status=//p' | tail -n1 | tr -d '[:space:]')"
+      # Only the words heartbeat-push.sh actually publishes are meaningful. A
+      # word we do not recognise is itself an unknown state, not a pass —
+      # decoding it optimistically is how a reader invents health.
+      case "$hb_status" in
+        healthy | degraded | mute | unknown) ;;
+        '') ;;
+        *) log "peer published an unrecognised status=$hb_status — treating it as unknown"
+           hb_status="unknown" ;;
+      esac
       ;;
     *)
       log "FATAL unknown PEER_KIND=$PEER_KIND"; exit 2 ;;
@@ -193,7 +223,7 @@ peer_last_seen() {
   [ -n "$iso" ] || return 1
   epoch="$(date -u -d "$iso" +%s 2>/dev/null)" || return 1
   [ -n "$epoch" ] || return 1
-  printf '%s\n%s\n' "$epoch" "$hb_exit"
+  printf '%s\n%s\n%s\n' "$epoch" "$hb_exit" "$hb_status"
 }
 
 # ── State ─────────────────────────────────────────────────────────────────
@@ -263,6 +293,11 @@ api_fail_streak="$(state_get api_fail_streak 0)"
 api_alarmed="$(state_get api_alarmed 0)"
 # The peer is running but told us its own notification channel is dead.
 mute_alarmed="$(state_get mute_alarmed 0)"
+# The peer is publishing, but the CHECKER IT SPEAKS FOR has not run. Its own
+# latch, not mute's: they are different failures with different first moves
+# (a dead timer vs a dead credential) and sharing a latch would let whichever
+# fired first suppress the other.
+unknown_alarmed="$(state_get unknown_alarmed 0)"
 # Consecutive runs in which OUR channel got nothing out. Reset by the first
 # send that lands. See notify() / finalize_send_streak().
 send_fail_streak="$(state_get send_fail_streak 0)"
@@ -278,6 +313,7 @@ state_write() {
     printf 'peer_status=%s\n' "$peer_status"
     printf 'peer_alarmed=%s\n' "$peer_alarmed"
     printf 'mute_alarmed=%s\n' "$mute_alarmed"
+    printf 'unknown_alarmed=%s\n' "$unknown_alarmed"
     printf 'api_fail_streak=%s\n' "$api_fail_streak"
     printf 'api_alarmed=%s\n' "$api_alarmed"
     printf 'send_fail_streak=%s\n' "$send_fail_streak"
@@ -315,10 +351,30 @@ send_telegram() {
   fi
   # Run logs may be public. Never echo the URL, the token, or the response
   # body — Telegram error bodies can echo request context back.
+  #
+  # ⚠ THE BODY GOES IN ARGV, THE TOKEN GOES ON STDIN. Do not "tidy" the
+  # `--data-urlencode` arguments back into the config text. A curl config file
+  # is parsed LINE BY LINE: a quoted value ENDS AT THE NEWLINE, so
+  # `data-urlencode = "text=<multi-line message>"` ships only the first line
+  # and re-reads the rest as further config options. Proven on this box
+  # (srv1550328, curl 8.5.0, 2026-09-05) with `--libcurl`:
+  #   CURLOPT_POSTFIELDS, "chat_id=123456&text=ALARM+line+one%0A"   (37 bytes)
+  # Lines 2 and 3 were gone, nothing was written to stderr, curl exited 0 and
+  # the server answered 200. EVERY multi-line alarm this script has ever sent
+  # arrived as its headline with the diagnosis stripped off, and the log said
+  # "telegram sendMessage ok". Newer curl (8.20) rejects the stray lines
+  # instead — `config file option 'It' is unknown`, exit 2 — which turns the
+  # same code into TOTAL alarm failure on the next Ubuntu upgrade.
+  # `--data-urlencode` given as an ARGUMENT has no such parser between it and
+  # the value, so newlines survive. The URL stays on stdin because it is the
+  # part that carries the token; the message body is not a secret.
+  # Covered by t_send_multiline_body_survives_peer in operations/tests/.
   set +x
-  code="$(printf 'url = "https://api.telegram.org/bot%s/sendMessage"\ndata-urlencode = "chat_id=%s"\ndata-urlencode = "text=%s"\n' \
-    "$TELEGRAM_BOT_TOKEN" "$TELEGRAM_CHAT_ID" "$text" \
-    | curl -sS --max-time 20 -o /dev/null -w '%{http_code}' --config - 2>/dev/null)"
+  code="$(printf 'url = "https://api.telegram.org/bot%s/sendMessage"\n' \
+    "$TELEGRAM_BOT_TOKEN" \
+    | curl -sS --max-time 20 -o /dev/null -w '%{http_code}' --config - \
+        --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+        --data-urlencode "text=${text}" 2>/dev/null)"
   if [ "$code" = "200" ]; then log "telegram sendMessage ok"; return 0; fi
   # PERMANENT vs TRANSIENT, same split as check.sh. A credential that is
   # PRESENT but REJECTED — a rotated token — is a dead channel; retrying it
@@ -432,11 +488,12 @@ final_exit() {
 
 # ── Decide ────────────────────────────────────────────────────────────────
 log "peer=$PEER_NAME kind=$PEER_KIND repo=$PEER_REPO stale_after=${PEER_STALE_AFTER}s"
-log "state in: peer_status=$peer_status peer_alarmed=$peer_alarmed mute_alarmed=$mute_alarmed api_fail_streak=$api_fail_streak send_fail_streak=$send_fail_streak"
+log "state in: peer_status=$peer_status peer_alarmed=$peer_alarmed mute_alarmed=$mute_alarmed unknown_alarmed=$unknown_alarmed api_fail_streak=$api_fail_streak send_fail_streak=$send_fail_streak"
 
 peer_read="$(peer_last_seen)"; rc=$?
 last_seen="$(printf '%s' "$peer_read" | sed -n 1p)"
 peer_exit="$(printf '%s' "$peer_read" | sed -n 2p)"
+peer_word="$(printf '%s' "$peer_read" | sed -n 3p)"
 
 if [ "$rc" -eq 2 ]; then
   # Could not ask GitHub. Says nothing about the peer. Do not touch peer state.
@@ -532,6 +589,52 @@ peer_status="fresh"
 # A peer that publishes no exit_code at all is NOT judged here. Absence is
 # "cannot tell", never "broken": the contract is that a bare timestamp still
 # reads as alive.
+#
+# ── UNKNOWN IS NOT OK ─────────────────────────────────────────────────────
+# `status=unknown` is checked FIRST and outranks everything below it, because
+# it is the one case where a fresh heartbeat is actively misleading. The
+# producer is alive and publishing on its own timer; the checker it publishes
+# ON BEHALF OF has stopped. Freshness has already passed by the time we get
+# here, and no exit_code is published in this state — so before 2026-09-05
+# this fell straight through to "freshness only" and exited 0, forever.
+#
+# Prove it can go red before trusting it: stop the checker's timer and leave
+# the heartbeat timer running. Within HB_STATUS_MAX_AGE (1 h) this must alarm.
+# Fixture: t_peer_unknown_status_alarms in operations/tests/run-tests.sh.
+if [ "$peer_word" = "unknown" ]; then
+  peer_status="unknown"
+  if [ "$unknown_alarmed" = "1" ]; then
+    log "already alarmed that $PEER_NAME is publishing status=unknown — staying quiet"
+  elif notify "$(printf '%s\n%s\n%s\n%s\n' \
+      "⚠️ PCIUS watcher — ${PEER_NAME} is publishing, but the check behind it has NOT RUN" \
+      "Its heartbeat is fresh (last seen $(fmt_utc "$last_seen") / $(fmt_local "$last_seen")), so the box and the publisher are alive. But it reported status=unknown, which means the checker it speaks for has not run recently enough to have a current result — a stopped timer, a crashed unit, or a state file it cannot read." \
+      "NOTHING IS BEING CHECKED RIGHT NOW. A fresh heartbeat here does NOT mean production is being watched." \
+      "$PEER_CONTEXT")"; then
+    note "PEER-UNKNOWN ${PEER_NAME} status=unknown"
+    unknown_alarmed=1
+  else
+    log "${PEER_NAME} is publishing status=unknown and that alarm did NOT go out — leaving unknown_alarmed=0 so the next run retries it"
+    note "PEER-UNKNOWN (alarm NOT delivered) ${PEER_NAME} status=unknown"
+  fi
+  state_write
+  log "state out: peer_status=$peer_status peer_alarmed=$peer_alarmed mute_alarmed=$mute_alarmed unknown_alarmed=$unknown_alarmed"
+  final_exit 1
+fi
+
+# The checker is producing a current result again. Same latch rule as
+# everywhere else in this script: an all-clear that did not go out must not
+# clear the latch, or the operator is left holding an alarm nothing retracts.
+if [ "$unknown_alarmed" = "1" ]; then
+  if notify "$(printf '%s\n%s\n' \
+    "🟢 PCIUS watcher — the check behind ${PEER_NAME} is running again" \
+    "It published status=${peer_word:-<none>} at $(fmt_utc "$last_seen"), so there is a current result once more.")"; then
+    note "PEER-UNKNOWN-RECOVERED ${PEER_NAME}"
+    unknown_alarmed=0
+  else
+    log "the status-unknown all-clear did NOT go out — keeping unknown_alarmed=1 so the next run retries it"
+  fi
+fi
+
 if [ -z "$peer_exit" ]; then
   log "peer published no exit_code — freshness only, not judging its channel"
 elif [ "$peer_exit" = "2" ]; then
@@ -549,7 +652,7 @@ elif [ "$peer_exit" = "2" ]; then
     note "PEER-MUTE (alarm NOT delivered) ${PEER_NAME} exit_code=$peer_exit"
   fi
   state_write
-  log "state out: peer_status=$peer_status peer_alarmed=$peer_alarmed mute_alarmed=$mute_alarmed"
+  log "state out: peer_status=$peer_status peer_alarmed=$peer_alarmed mute_alarmed=$mute_alarmed unknown_alarmed=$unknown_alarmed"
   final_exit 1
 else
   log "peer reported exit_code=$peer_exit — its channel is working"
@@ -566,5 +669,5 @@ else
 fi
 
 state_write
-log "state out: peer_status=$peer_status peer_alarmed=$peer_alarmed mute_alarmed=$mute_alarmed"
+log "state out: peer_status=$peer_status peer_alarmed=$peer_alarmed mute_alarmed=$mute_alarmed unknown_alarmed=$unknown_alarmed"
 final_exit 0
