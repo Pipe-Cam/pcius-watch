@@ -61,6 +61,22 @@ PEER_CONTEXT="${PEER_CONTEXT:-Production itself is being watched normally from t
 # design is trying to avoid. They get their own streak and their own message.
 PEER_API_FAIL_CYCLES="${PEER_API_FAIL_CYCLES:-8}"
 
+# Cross-run flap protection for the peer's CONTENT reading — staleness (age >
+# PEER_STALE_AFTER) or a published status=unknown — mirroring check.sh's
+# WATCH_FAIL_CYCLES=2 exactly (same name, same default, same shape: a small
+# fixed streak of consecutive bad READINGS, distinct from PEER_API_FAIL_CYCLES
+# above which guards the transport, not the content). A single anomalous
+# reading — one bad element[0] from an unauthenticated, rate-limited GitHub
+# API call trusted without retry — must not page Brian on its own; two
+# consecutive anomalous readings in a row is the same bar check.sh already
+# holds production probes to. This does NOT relax PEER_STALE_AFTER or the
+# 15-minute timer: it is orthogonal debounce on the READING, not a change to
+# what counts as stale or how often this runs. Proven 2026-09-09: a single
+# transient GitHub API response returned a two-day-old workflow run as
+# element[0], skipping thirteen newer successful runs, and paged Brian over a
+# watcher that never stopped.
+PEER_CONTENT_FAIL_CYCLES="${PEER_CONTENT_FAIL_CYCLES:-2}"
+
 # Consecutive RUNS in which nothing got out over Telegram. A transient failure
 # that never clears is not meaningfully different from a revoked credential: a
 # 500 on every run for a day silences this alarm exactly as completely as a 401
@@ -291,6 +307,11 @@ peer_status="$(state_get peer_status fresh)"
 peer_alarmed="$(state_get peer_alarmed 0)"
 api_fail_streak="$(state_get api_fail_streak 0)"
 api_alarmed="$(state_get api_alarmed 0)"
+# Consecutive runs whose CONTENT reading was anomalous (stale or
+# status=unknown). Reset on any normal reading — see the classification just
+# above the stale/unknown checks below. Distinct from api_fail_streak, which
+# guards transport failures, not content.
+content_fail_streak="$(state_get content_fail_streak 0)"
 # The peer is running but told us its own notification channel is dead.
 mute_alarmed="$(state_get mute_alarmed 0)"
 # The peer is publishing, but the CHECKER IT SPEAKS FOR has not run. Its own
@@ -316,6 +337,7 @@ state_write() {
     printf 'unknown_alarmed=%s\n' "$unknown_alarmed"
     printf 'api_fail_streak=%s\n' "$api_fail_streak"
     printf 'api_alarmed=%s\n' "$api_alarmed"
+    printf 'content_fail_streak=%s\n' "$content_fail_streak"
     printf 'send_fail_streak=%s\n' "$send_fail_streak"
     printf 'peer_last_seen=%s\n' "${last_seen:-0}"
   } | store_save
@@ -488,7 +510,7 @@ final_exit() {
 
 # ── Decide ────────────────────────────────────────────────────────────────
 log "peer=$PEER_NAME kind=$PEER_KIND repo=$PEER_REPO stale_after=${PEER_STALE_AFTER}s"
-log "state in: peer_status=$peer_status peer_alarmed=$peer_alarmed mute_alarmed=$mute_alarmed unknown_alarmed=$unknown_alarmed api_fail_streak=$api_fail_streak send_fail_streak=$send_fail_streak"
+log "state in: peer_status=$peer_status peer_alarmed=$peer_alarmed mute_alarmed=$mute_alarmed unknown_alarmed=$unknown_alarmed api_fail_streak=$api_fail_streak content_fail_streak=$content_fail_streak send_fail_streak=$send_fail_streak"
 
 peer_read="$(peer_last_seen)"; rc=$?
 last_seen="$(printf '%s' "$peer_read" | sed -n 1p)"
@@ -544,23 +566,50 @@ fi
 age=$((NOW - last_seen))
 log "peer last seen $(fmt_utc "$last_seen") — ${age}s ago (threshold ${PEER_STALE_AFTER}s)"
 
+# ── Debounce the CONTENT reading itself, before judging it ────────────────
+# A single anomalous reading — too old, or (further below) a fresh timestamp
+# carrying status=unknown — must not page Brian on its own. Two consecutive
+# anomalous readings in a row is the same flap guard check.sh already applies
+# to production probes (WATCH_FAIL_CYCLES=2). This is evaluated ONCE, here,
+# on the raw reading, before either the stale or the unknown branch decides
+# whether to alarm — both branches gate on the SAME streak, because both are
+# the same underlying risk (one bad sample of this run's GitHub API read),
+# just expressed as a different symptom.
+if [ "$age" -gt "$PEER_STALE_AFTER" ] || [ "$peer_word" = "unknown" ]; then
+  content_fail_streak=$((content_fail_streak + 1))
+  log "content reading anomalous (streak $content_fail_streak/$PEER_CONTENT_FAIL_CYCLES)"
+else
+  if [ "$content_fail_streak" != "0" ]; then
+    log "content reading is normal — resetting content_fail_streak (was $content_fail_streak)"
+  fi
+  content_fail_streak=0
+fi
+
 if [ "$age" -gt "$PEER_STALE_AFTER" ]; then
   # peer_status tracks REALITY — the peer IS stale whether or not we got the
   # word out. peer_alarmed tracks whether A HUMAN WAS TOLD. Setting them
   # together is the bug this block used to have.
-  peer_status="stale"
   if [ "$peer_alarmed" = "1" ]; then
+    peer_status="stale"
     log "already alarmed about $PEER_NAME — staying quiet"
-  elif notify "$(printf '%s\n%s\n%s\n%s\n' \
-      "⚠️ PCIUS watcher — ${PEER_NAME} has gone quiet" \
-      "It has not checked in for $(fmt_duration "$age"). Last seen $(fmt_utc "$last_seen") ($(fmt_local "$last_seen"))." \
-      "$PEER_CONTEXT" \
-      "I will message again when it comes back.")"; then
-    note "PEER-STALE ${PEER_NAME} age=${age}s"
-    peer_alarmed=1
+  elif [ "$content_fail_streak" -lt "$PEER_CONTENT_FAIL_CYCLES" ]; then
+    # Below the debounce threshold: a real reading, but not yet two in a row.
+    # Deliberately do NOT flip peer_status here — the same flap guard as
+    # check.sh, which leaves `status` untouched below WATCH_FAIL_CYCLES.
+    log "$PEER_NAME looks stale but below the ${PEER_CONTENT_FAIL_CYCLES}-reading threshold (streak $content_fail_streak) — not alarming yet, this is the flap guard for one bad API sample"
   else
-    log "${PEER_NAME} has gone quiet and the alarm did NOT go out — leaving peer_alarmed=0 so the next run retries the alarm"
-    note "PEER-STALE (alarm NOT delivered) ${PEER_NAME} age=${age}s"
+    peer_status="stale"
+    if notify "$(printf '%s\n%s\n%s\n%s\n' \
+        "⚠️ PCIUS watcher — ${PEER_NAME} has gone quiet" \
+        "It has not checked in for $(fmt_duration "$age"). Last seen $(fmt_utc "$last_seen") ($(fmt_local "$last_seen"))." \
+        "$PEER_CONTEXT" \
+        "I will message again when it comes back.")"; then
+      note "PEER-STALE ${PEER_NAME} age=${age}s"
+      peer_alarmed=1
+    else
+      log "${PEER_NAME} has gone quiet and the alarm did NOT go out — leaving peer_alarmed=0 so the next run retries the alarm"
+      note "PEER-STALE (alarm NOT delivered) ${PEER_NAME} age=${age}s"
+    fi
   fi
   state_write
   final_exit 1
@@ -602,19 +651,26 @@ peer_status="fresh"
 # the heartbeat timer running. Within HB_STATUS_MAX_AGE (1 h) this must alarm.
 # Fixture: t_peer_unknown_status_alarms in operations/tests/run-tests.sh.
 if [ "$peer_word" = "unknown" ]; then
-  peer_status="unknown"
   if [ "$unknown_alarmed" = "1" ]; then
+    peer_status="unknown"
     log "already alarmed that $PEER_NAME is publishing status=unknown — staying quiet"
-  elif notify "$(printf '%s\n%s\n%s\n%s\n' \
-      "⚠️ PCIUS watcher — ${PEER_NAME} is publishing, but the check behind it has NOT RUN" \
-      "Its heartbeat is fresh (last seen $(fmt_utc "$last_seen") / $(fmt_local "$last_seen")), so the box and the publisher are alive. But it reported status=unknown, which means the checker it speaks for has not run recently enough to have a current result — a stopped timer, a crashed unit, or a state file it cannot read." \
-      "NOTHING IS BEING CHECKED RIGHT NOW. A fresh heartbeat here does NOT mean production is being watched." \
-      "$PEER_CONTEXT")"; then
-    note "PEER-UNKNOWN ${PEER_NAME} status=unknown"
-    unknown_alarmed=1
+  elif [ "$content_fail_streak" -lt "$PEER_CONTENT_FAIL_CYCLES" ]; then
+    # Same flap guard as the stale branch above, and the SAME streak — see
+    # the classification comment near `age=$((NOW - last_seen))`.
+    log "$PEER_NAME is publishing status=unknown but below the ${PEER_CONTENT_FAIL_CYCLES}-reading threshold (streak $content_fail_streak) — not alarming yet, this is the flap guard for one bad API sample"
   else
-    log "${PEER_NAME} is publishing status=unknown and that alarm did NOT go out — leaving unknown_alarmed=0 so the next run retries it"
-    note "PEER-UNKNOWN (alarm NOT delivered) ${PEER_NAME} status=unknown"
+    peer_status="unknown"
+    if notify "$(printf '%s\n%s\n%s\n%s\n' \
+        "⚠️ PCIUS watcher — ${PEER_NAME} is publishing, but the check behind it has NOT RUN" \
+        "Its heartbeat is fresh (last seen $(fmt_utc "$last_seen") / $(fmt_local "$last_seen")), so the box and the publisher are alive. But it reported status=unknown, which means the checker it speaks for has not run recently enough to have a current result — a stopped timer, a crashed unit, or a state file it cannot read." \
+        "NOTHING IS BEING CHECKED RIGHT NOW. A fresh heartbeat here does NOT mean production is being watched." \
+        "$PEER_CONTEXT")"; then
+      note "PEER-UNKNOWN ${PEER_NAME} status=unknown"
+      unknown_alarmed=1
+    else
+      log "${PEER_NAME} is publishing status=unknown and that alarm did NOT go out — leaving unknown_alarmed=0 so the next run retries it"
+      note "PEER-UNKNOWN (alarm NOT delivered) ${PEER_NAME} status=unknown"
+    fi
   fi
   state_write
   log "state out: peer_status=$peer_status peer_alarmed=$peer_alarmed mute_alarmed=$mute_alarmed unknown_alarmed=$unknown_alarmed"
